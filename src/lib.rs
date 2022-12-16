@@ -1,3 +1,5 @@
+mod impl2;
+
 use fnv::{FnvBuildHasher, FnvHashMap, FnvHashSet};
 use generational_arena::{Arena, Index};
 use std::borrow::Borrow;
@@ -20,6 +22,7 @@ pub struct Dag<N> {
 pub enum Error {
     /// The requested node was not found on the graph.
     NodeNotFound,
+    SelfLoop,
 }
 
 #[derive(Default)]
@@ -162,6 +165,10 @@ where
         let v_index = *self.nodes.get(v).ok_or(Error::NodeNotFound)?;
         let u_index = *self.nodes.get(u).ok_or(Error::NodeNotFound)?;
 
+        if v_index == u_index {
+            return Err(Error::SelfLoop);
+        }
+
         if self
             .entries
             .get(v_index.0)
@@ -197,6 +204,10 @@ where
     {
         let v_index = self.nodes.get(v).ok_or(Error::NodeNotFound)?;
         let u_index = self.nodes.get(u).ok_or(Error::NodeNotFound)?;
+
+        if v_index == u_index {
+            return Err(Error::SelfLoop);
+        }
 
         let cycles = {
             let tmp = self.entries.get2_mut(v_index.0, u_index.0);
@@ -245,9 +256,10 @@ where
         let u_index = *self.nodes.get(u).ok_or(Error::NodeNotFound)?;
         let v_entry = self.entries.get(v_index.0).unwrap();
         let u_entry = self.entries.get(u_index.0).unwrap();
+        let has_cycles = !v_entry.cycles.is_empty() || !u_entry.cycles.is_empty();
 
         if v_entry.order > u_entry.order {
-            if !v_entry.cycles.iter().any(|a| u_entry.cycles.contains(a)) {
+            if !has_cycles {
                 return Ok(false);
             }
 
@@ -258,10 +270,16 @@ where
             return Ok(visitor.finish());
         }
 
+        let range = if has_cycles {
+            0..=u64::MAX
+        } else {
+            0..=u_entry.order
+        };
+
         let mut visitor = SearchVisitor::new(u_index);
         let mut traverser = Traverser::new(Direction::Forward);
         traverser.push_index(v_index);
-        traverser.traverse(self, 0..=u_entry.order, &mut visitor);
+        traverser.traverse(self, range, &mut visitor);
         Ok(visitor.finish())
     }
 
@@ -361,7 +379,7 @@ where
         let mut visited_backward = CollectVisitor::default();
 
         // compute the cycles that are present in `v` but not in `u`.
-        let (cycles, v_order, u_order) = {
+        let (cycles, v_order, u_order, has_cycles) = {
             let v_entry = self.entries.get(v_index.0).unwrap();
             let u_entry = self.entries.get(u_index.0).unwrap();
 
@@ -371,7 +389,12 @@ where
                 .cloned()
                 .collect::<Vec<_>>();
 
-            (cycles, v_entry.order, u_entry.order)
+            (
+                cycles,
+                v_entry.order,
+                u_entry.order,
+                !v_entry.cycles.is_empty() || !u_entry.cycles.is_empty(),
+            )
         };
 
         // if any such cycle is found, insert those to `u` and all of `u`'s children.
@@ -389,14 +412,19 @@ where
         }
 
         // if we're already sorted, we don't need to make any changes.
-        if v_order <= u_order {
+        if v_order <= u_order && !has_cycles {
             return;
         }
 
         if !traverser.has_visited(&u_index) {
+            let range = if v_order <= u_order {
+                0..=u64::MAX
+            } else {
+                0..=v_order
+            };
             // otherwise we have already visited all of the children of `u`.
             traverser.push_index(u_index);
-            traverser.traverse(self, 0..=v_order, &mut visited_forward);
+            traverser.traverse(self, range, &mut visited_forward);
         }
 
         if traverser.has_visited(&v_index) {
@@ -466,16 +494,6 @@ where
             let index = index_iter.next().unwrap().0;
             self.entries.get_mut(index.0).unwrap().order = visited_backward[i2].1;
             i2 += 1;
-        }
-    }
-
-    /// For every node in this graph, check if all the cycles exist.
-    #[cfg(test)]
-    fn debug_check_cycles_exist(&self) {
-        for (_, entry) in &self.entries {
-            for cycle in &entry.cycles {
-                self.cycles.get(cycle.0).expect("Dead reference");
-            }
         }
     }
 }
@@ -664,12 +682,12 @@ impl UpdateCyclesReason {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils {
     use crate::{Cycle, Dag, NodeIndex};
     use fnv::{FnvHashMap, FnvHashSet};
 
-    type Node = u64;
+    pub type Node = u8;
 
     impl Dag<Node> {
         /// Return the active cycles in this graph.
@@ -689,16 +707,27 @@ mod tests {
 
             cycles
         }
+
+        /// For every node in this graph, check if all the cycles exist.
+        fn debug_check_cycles_exist(&self) {
+            for (_, entry) in &self.entries {
+                for cycle in &entry.cycles {
+                    self.cycles.get(cycle.0).expect("Dead reference");
+                }
+            }
+        }
     }
 
+    /// The implementation wrapped with a naive implementation as a reference and checks are done
+    /// per mutation on the graph to ensure the correctness of the incremental implementation.
     #[derive(Default)]
-    struct NaiveGraph {
+    pub struct NaiveBackedDag {
         nodes: FnvHashMap<Node, FnvHashSet<Node>>,
         cycles: FnvHashSet<(Node, Node)>,
         dag: Dag<Node>,
     }
 
-    impl NaiveGraph {
+    impl NaiveBackedDag {
         pub fn insert(&mut self, node: Node) {
             self.dag.insert(node);
             self.nodes.entry(node).or_default();
@@ -716,13 +745,23 @@ mod tests {
         }
 
         pub fn connect(&mut self, v: Node, u: Node) {
+            if v == u {
+                self.dag.connect(&v, &u);
+                self.update_cycles();
+                self.assert_order();
+                return;
+            }
+
             if self.nodes.contains_key(&u) {
                 if let Some(e) = self.nodes.get_mut(&v) {
-                    e.insert(u);
-
-                    // if there is a path from `u -> v`, then we have a new cycle.
-                    if self.dag.is_reachable(&u, &v).unwrap() {
-                        self.cycles.insert((v, u));
+                    // check if the connection doesn't already exist.
+                    if e.insert(u) {
+                        // if there is a path from `u -> v`, then we have a new cycle. but there
+                        // shouldn't already be a path from `v -> u` otherwise the cycle is not
+                        // new.
+                        if self.dag.is_reachable(&u, &v).unwrap() {
+                            self.cycles.insert((v, u));
+                        }
                     }
 
                     self.dag.connect(&v, &u).unwrap();
@@ -734,6 +773,13 @@ mod tests {
         }
 
         pub fn disconnect(&mut self, v: Node, u: Node) {
+            if v == u {
+                self.dag.disconnect(&v, &u);
+                self.update_cycles();
+                self.assert_order();
+                return;
+            }
+
             if self.nodes.contains_key(&u) {
                 if let Some(e) = self.nodes.get_mut(&v) {
                     e.remove(&u);
@@ -798,10 +844,15 @@ mod tests {
             self.dag.is_reachable(&v, &u).unwrap()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_utils::NaiveBackedDag;
 
     #[test]
-    fn full() {
-        let mut g = NaiveGraph::default();
+    fn e2e() {
+        let mut g = NaiveBackedDag::default();
         g.insert(0);
         g.insert(1);
         g.insert(2);
@@ -843,5 +894,18 @@ mod tests {
         g.delete(0);
         // B -> C
         g.disconnect(2, 1);
+    }
+
+    #[test]
+    fn x() {
+        let mut g = NaiveBackedDag::default();
+        g.insert(0);
+        g.insert(177);
+        g.insert(215);
+        g.connect(0, 177);
+        g.connect(177, 0);
+        g.connect(0, 215);
+        g.disconnect(0, 215);
+        g.delete(177);
     }
 }

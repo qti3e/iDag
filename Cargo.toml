@@ -8,3 +8,6 @@ edition = "2021"
 [dependencies]
 generational-arena = "0.2.8"
 fnv = "1.0.7"
+
+[features]
+test-utils = []

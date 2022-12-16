@@ -1,0 +1,29 @@
+[package]
+name = "poisoned-dag-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.poisoned-dag]
+path = ".."
+features = ["test-utils"]
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "dag"
+path = "fuzz_targets/dag.rs"
+test = false
+doc = false
