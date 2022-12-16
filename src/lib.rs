@@ -1,7 +1,7 @@
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::{FnvBuildHasher, FnvHashMap, FnvHashSet};
 use generational_arena::{Arena, Index};
 use std::borrow::Borrow;
-use std::collections::{hash_map, HashMap, VecDeque};
+use std::collections::{hash_map, VecDeque};
 use std::hash::Hash;
 use std::ops::{ControlFlow, RangeBounds};
 
@@ -92,8 +92,13 @@ where
     }
 
     /// Create a new empty dag with pre-allocated storage for `n` nodes.
-    pub fn with_capacity(_n: u64) -> Self {
-        todo!()
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            entries: Arena::with_capacity(n),
+            cycles: Arena::with_capacity(n),
+            nodes: FnvHashMap::with_capacity_and_hasher(n, FnvBuildHasher::default()),
+            next_order: 0,
+        }
     }
 
     /// Insert a new node into the graph. Performs nothing if the nodes is already inserted.
@@ -203,16 +208,18 @@ where
                 return Ok(());
             }
 
-            u_entry.backward.insert(*v_index);
+            u_entry.backward.remove(v_index);
 
             v_entry
                 .cycles
                 .intersection(&u_entry.cycles)
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect::<FnvHashSet<_>>()
         };
 
-        if !cycles.is_empty() {}
+        if !cycles.is_empty() {
+            self.update_cycles(UpdateCyclesReason::DeleteEdge(*v_index, *u_index), cycles);
+        }
 
         Ok(())
     }
@@ -236,15 +243,46 @@ where
     {
         let v_index = *self.nodes.get(v).ok_or(Error::NodeNotFound)?;
         let u_index = *self.nodes.get(u).ok_or(Error::NodeNotFound)?;
+        let v_entry = self.entries.get(v_index.0).unwrap();
         let u_entry = self.entries.get(u_index.0).unwrap();
+
+        if v_entry.order > u_entry.order {
+            if !v_entry.cycles.iter().any(|a| u_entry.cycles.contains(a)) {
+                return Ok(false);
+            }
+
+            let mut visitor = SearchVisitor::new(v_index);
+            let mut traverser = Traverser::new(Direction::Backward);
+            traverser.push_index(u_index);
+            traverser.traverse(self, 0..=u64::MAX, &mut visitor);
+            return Ok(visitor.finish());
+        }
+
         let mut visitor = SearchVisitor::new(u_index);
         let mut traverser = Traverser::new(Direction::Forward);
         traverser.push_index(v_index);
-        traverser.traverse(&self, 0..u_entry.order, &mut visitor);
+        traverser.traverse(self, 0..=u_entry.order, &mut visitor);
         Ok(visitor.finish())
     }
 
+    /// Return the order of a given node in this DAG.
+    pub fn get_order<Q: ?Sized>(&self, v: &Q) -> Option<u64>
+    where
+        N: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        let v_index = *self.nodes.get(v).ok_or(Error::NodeNotFound).unwrap();
+        let v_entry = self.entries.get(v_index.0).unwrap();
+        if v_entry.cycles.is_empty() {
+            Some(v_entry.order)
+        } else {
+            None
+        }
+    }
+
     fn update_cycles(&mut self, reason: UpdateCyclesReason, cycles: FnvHashSet<CycleIndex>) {
+        debug_assert!(!cycles.is_empty());
+
         let mut to_be_removed = Vec::<CycleIndex>::new();
         let mut to_check = Vec::<(CycleIndex, Cycle)>::new();
         let mut traverser = Traverser::new(Direction::Forward);
@@ -261,37 +299,53 @@ where
         }
 
         if !to_be_removed.is_empty() {
-            traverser.traverse(&self, 0..=u64::MAX, &mut ());
+            traverser.traverse(self, 0..=u64::MAX, &mut ());
             for index in &traverser.visited {
                 let entry = self.entries.get_mut(index.0).unwrap();
                 for c in &to_be_removed {
                     entry.cycles.remove(c);
                 }
             }
+            for c in &to_be_removed {
+                self.cycles.remove(c.0);
+            }
         }
 
+        let mut traverser = Traverser::new(Direction::Forward);
+
         for (index, Cycle(v_index, u_index)) in to_check {
-            let mut traverser = Traverser::new(Direction::Forward);
+            traverser.visited.clear();
+
+            let mut visited_forward = CollectVisitor::default();
             traverser.push_index(u_index);
-            traverser.traverse(&self, 0..=u64::MAX, &mut ());
+            traverser.traverse(self, 0..=u64::MAX, &mut visited_forward);
 
             let reorder = if traverser.has_visited(&v_index) {
-                // The cycle is not destroyed.
-                let mut visited_forward = CollectVisitor::default();
+                // The cycle is not destroyed, we should delete the cycle only from the elements
+                // that are not in the cycle anymore.
+                visited_forward.clear();
                 traverser.push_index(*reason.base());
                 traverser.traverse(&self, 0..=u64::MAX, &mut visited_forward);
                 false
             } else {
                 // The cycle is destroyed.
                 self.cycles.remove(index.0);
-                traverser.push_index(*reason.base());
+                match reason {
+                    UpdateCyclesReason::DeleteEdge(a, b) => {
+                        traverser.push_index(a);
+                        traverser.push_index(b);
+                    }
+                    UpdateCyclesReason::DeleteNode(a) => {
+                        traverser.push_index(a);
+                    }
+                }
                 traverser.push_index(v_index);
-                traverser.traverse(&self, 0..=u64::MAX, &mut ());
+                traverser.traverse(self, 0..=u64::MAX, &mut visited_forward);
                 true
             };
 
-            for forward in traverser.visited {
-                let entry = self.entries.get_mut(forward.0).unwrap();
+            for (node_index, _) in visited_forward.finish() {
+                let entry = self.entries.get_mut(node_index.0).unwrap();
                 entry.cycles.remove(&index);
             }
 
@@ -323,7 +377,7 @@ where
         // if any such cycle is found, insert those to `u` and all of `u`'s children.
         if !cycles.is_empty() {
             traverser.push_index(u_index);
-            traverser.traverse(&self, 0..=u64::MAX, &mut visited_forward);
+            traverser.traverse(self, 0..=u64::MAX, &mut visited_forward);
 
             for (node_index, _) in &mut visited_forward.visited {
                 self.entries
@@ -342,7 +396,7 @@ where
         if !traverser.has_visited(&u_index) {
             // otherwise we have already visited all of the children of `u`.
             traverser.push_index(u_index);
-            traverser.traverse(&self, 0..=v_order, &mut visited_forward);
+            traverser.traverse(self, 0..=v_order, &mut visited_forward);
         }
 
         if traverser.has_visited(&v_index) {
@@ -350,7 +404,7 @@ where
             // of the new cycle.
             // For that, we first visit all of the nodes starting from `v`.
             traverser.push_index(v_index);
-            traverser.traverse(&self, 0..=u64::MAX, &mut visited_forward);
+            traverser.traverse(self, 0..=u64::MAX, &mut visited_forward);
 
             // create the new cycle.
             let cycle = Cycle(v_index, u_index);
@@ -366,7 +420,7 @@ where
         } else {
             traverser.move_backward();
             traverser.push_index(v_index);
-            traverser.traverse(&self, u_order.., &mut visited_backward);
+            traverser.traverse(self, (u_order + 1).., &mut visited_backward);
             let visited_forward = visited_forward.finish();
             let visited_backward = visited_backward.finish();
             self.reorder(visited_forward, visited_backward);
@@ -414,6 +468,16 @@ where
             i2 += 1;
         }
     }
+
+    /// For every node in this graph, check if all the cycles exist.
+    #[cfg(test)]
+    fn debug_check_cycles_exist(&self) {
+        for (_, entry) in &self.entries {
+            for cycle in &entry.cycles {
+                self.cycles.get(cycle.0).expect("Dead reference");
+            }
+        }
+    }
 }
 
 impl Traverser {
@@ -449,7 +513,7 @@ impl Traverser {
     /// Change the traverse's direction to move backward.
     #[inline(always)]
     pub fn move_backward(&mut self) {
-        self.direction = Direction::Forward;
+        self.direction = Direction::Backward;
     }
 
     /// Start visiting the provided graph at the given range with the provided visitor.
@@ -467,12 +531,14 @@ impl Traverser {
                 continue;
             }
 
-            // only pass the node to the visitor if it has not been seen before.
-            if self.visited.insert(index) {
-                // pass it to the visitor.
-                if visitor.visit(&index, entry.order) == ControlFlow::Break(()) {
-                    break;
-                }
+            // only visit once.
+            if !self.visited.insert(index) {
+                continue;
+            }
+
+            // pass it to the visitor.
+            if visitor.visit(&index, entry.order) == ControlFlow::Break(()) {
+                break;
             }
 
             // get the next nodes we have to visit depending on the direction.
@@ -550,6 +616,13 @@ impl Visitor for CollectVisitor {
     }
 }
 
+impl CollectVisitor {
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.visited.clear();
+    }
+}
+
 impl Visitor for () {
     type Result = ();
 
@@ -591,38 +664,184 @@ impl UpdateCyclesReason {
     }
 }
 
-#[test]
-fn x() {
-    let mut dag = Dag::<String>::new();
-    dag.insert("B".into());
-    dag.insert("A".into());
-    dag.insert("C".into());
-    dag.insert("D".into());
-    dag.connect("B", "A").unwrap();
-    dag.connect("A", "B").unwrap();
-    dag.connect("A", "C").unwrap();
-    // dag.connect("D", "C").unwrap();
-    // dag.connect("C", "A").unwrap();
-    dag.remove("C");
+#[cfg(test)]
+mod tests {
+    use crate::{Cycle, Dag, NodeIndex};
+    use fnv::{FnvHashMap, FnvHashSet};
 
-    let mut nodes = dag.nodes.iter().collect::<Vec<_>>();
-    nodes.sort_by_key(|(_, i)| dag.entries.get(i.0).unwrap().order);
-    let nodes = nodes.into_iter().map(|a| a.0).collect::<Vec<_>>();
+    type Node = u64;
 
-    println!("Order=");
-    println!("{:?}", nodes);
-    println!("Cycles=");
-    {
-        let mut index_to_str = HashMap::new();
-        let mut cycles = Vec::<(&String, &String)>::new();
-        for (s, i) in dag.nodes {
-            index_to_str.insert(i, s);
+    impl Dag<Node> {
+        /// Return the active cycles in this graph.
+        fn cycles(&self) -> FnvHashSet<(Node, Node)> {
+            let mut cycles = FnvHashSet::default();
+            let mut index_to_node = FnvHashMap::<NodeIndex, Node>::default();
+
+            for (node, index) in &self.nodes {
+                index_to_node.insert(*index, *node);
+            }
+
+            for (_, Cycle(v, u)) in self.cycles.iter() {
+                let v = *index_to_node.get(v).unwrap();
+                let u = *index_to_node.get(u).unwrap();
+                cycles.insert((v, u));
+            }
+
+            cycles
         }
-        for cycle in dag.cycles {
-            let v = index_to_str.get(&cycle.0).unwrap();
-            let u = index_to_str.get(&cycle.1).unwrap();
-            cycles.push((v, u));
+    }
+
+    #[derive(Default)]
+    struct NaiveGraph {
+        nodes: FnvHashMap<Node, FnvHashSet<Node>>,
+        cycles: FnvHashSet<(Node, Node)>,
+        dag: Dag<Node>,
+    }
+
+    impl NaiveGraph {
+        pub fn insert(&mut self, node: Node) {
+            self.dag.insert(node);
+            self.nodes.entry(node).or_default();
+            self.assert_order();
         }
-        println!("{:?}", cycles);
+
+        pub fn delete(&mut self, node: Node) {
+            self.dag.remove(&node);
+            self.nodes.remove(&node);
+            self.nodes.iter_mut().for_each(|(_, s)| {
+                s.remove(&node);
+            });
+            self.update_cycles();
+            self.assert_order();
+        }
+
+        pub fn connect(&mut self, v: Node, u: Node) {
+            if self.nodes.contains_key(&u) {
+                if let Some(e) = self.nodes.get_mut(&v) {
+                    e.insert(u);
+
+                    // if there is a path from `u -> v`, then we have a new cycle.
+                    if self.dag.is_reachable(&u, &v).unwrap() {
+                        self.cycles.insert((v, u));
+                    }
+
+                    self.dag.connect(&v, &u).unwrap();
+                    self.assert_order();
+                    return;
+                }
+            }
+            assert!(self.dag.connect(&v, &u).is_err());
+        }
+
+        pub fn disconnect(&mut self, v: Node, u: Node) {
+            if self.nodes.contains_key(&u) {
+                if let Some(e) = self.nodes.get_mut(&v) {
+                    e.remove(&u);
+                    self.dag.disconnect(&v, &u).unwrap();
+                    self.cycles.retain(|(a, b)| !(a == &v && b == &u));
+                    self.update_cycles();
+                    self.assert_order();
+                    return;
+                }
+            }
+            assert!(self.dag.connect(&v, &u).is_err());
+        }
+
+        // iterate through all of the cycles and check if they still exits and remove the ones
+        // that no longer exists from the graph.
+        pub fn update_cycles(&mut self) {
+            self.cycles.retain(|(v, u)| {
+                if self.dag.nodes.contains_key(v) && self.dag.nodes.contains_key(u) {
+                    self.dag.is_reachable(u, v).unwrap() && self.dag.is_reachable(v, u).unwrap()
+                } else {
+                    false
+                }
+            });
+        }
+
+        pub fn assert_order(&self) {
+            self.dag.debug_check_cycles_exist();
+
+            if !self.cycles.is_empty() || !self.dag.cycles.is_empty() {
+                let actual_cycles = self.dag.cycles();
+                assert_eq!(&actual_cycles, &self.cycles);
+            }
+
+            for (v, edges) in &self.nodes {
+                for u in edges {
+                    let v_order = self.dag.get_order(v);
+                    let u_order = self.dag.get_order(u);
+                    if let (Some(v_o), Some(u_o)) = (v_order, u_order) {
+                        assert!(v_o < u_o)
+                    }
+                    assert!(
+                        self.dag.is_connected(v, u).unwrap(),
+                        "no connected: {} -> {}",
+                        v,
+                        u
+                    );
+                    assert!(
+                        self.dag.is_reachable(v, u).unwrap(),
+                        "not reachable: {} -> {}",
+                        v,
+                        u
+                    );
+                }
+            }
+        }
+
+        pub fn is_connected(&self, v: Node, u: Node) -> bool {
+            self.dag.is_connected(&v, &u).unwrap()
+        }
+
+        pub fn is_reachable(&self, v: Node, u: Node) -> bool {
+            self.dag.is_reachable(&v, &u).unwrap()
+        }
+    }
+
+    #[test]
+    fn full() {
+        let mut g = NaiveGraph::default();
+        g.insert(0);
+        g.insert(1);
+        g.insert(2);
+        // A -> B
+        g.connect(0, 1);
+        // A -> B -> C
+        g.connect(1, 2);
+        // A -> B -> C
+        // ^________/
+        g.connect(2, 0);
+        // +----+
+        // V    |
+        // A -> B -> C
+        // ^_________+
+        g.connect(1, 0);
+        // A -> B -> C
+        // ^_________+
+        g.disconnect(1, 0);
+        // B -> C -> A
+        // \_________^
+        g.disconnect(0, 1);
+        g.connect(1, 0);
+        // +----+
+        // V    |
+        // B -> C -> A
+        // \_________^
+        g.connect(2, 1);
+        // +----+ +---+
+        // V    | V   |
+        // B ->  C -> A
+        // \__________^
+        g.connect(0, 2);
+        // +----+
+        // V    |
+        // B -> C <- A
+        // \_________^
+        g.disconnect(2, 0);
+        // B <-> C
+        g.delete(0);
+        // B -> C
+        g.disconnect(2, 1);
     }
 }
