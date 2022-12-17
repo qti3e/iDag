@@ -1,6 +1,6 @@
 # Poisoned DAG
 
-An efficient incremental DAG for real-time type verification systems or other purposes.
+An (not-yet) efficient incremental DAG for real-time type verification systems or other purposes.
 
 Maintaining the topological ordering is based on the work presented in
 [this paper](https://dl.acm.org/doi/10.1145/1187436.1210590):

@@ -2,8 +2,8 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use poisoned_dag::test_utils::{NaiveBackedDag, Node};
-use std::fmt::{Debug, Formatter, Pointer};
+use poisoned_dag::naive::{Node, WrappedDag};
+use std::fmt::{Debug, Formatter};
 
 #[derive(Arbitrary)]
 struct Input {
@@ -16,22 +16,26 @@ enum DagMethod {
     Delete { node: Node },
     Connect { v: Node, u: Node },
     Disconnect { v: Node, u: Node },
+    IsReachable { v: Node, u: Node },
 }
 
 impl Debug for DagMethod {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             DagMethod::Insert { node } => {
-                write!(f, "g.insert({});", node)
+                write!(f, "g.insert({:?});", node)
             }
             DagMethod::Delete { node } => {
-                write!(f, "g.delete({});", node)
+                write!(f, "g.remove({:?});", node)
             }
             DagMethod::Connect { v, u } => {
-                write!(f, "g.connect({}, {});", v, u)
+                write!(f, "g.connect({:?}, {:?});", v, u)
             }
             DagMethod::Disconnect { v, u } => {
-                write!(f, "g.disconnect({}, {});", v, u)
+                write!(f, "g.disconnect({:?}, {:?});", v, u)
+            }
+            DagMethod::IsReachable { v, u } => {
+                write!(f, "g.is_reachable({:?}, {:?});", v, u)
             }
         }
     }
@@ -50,14 +54,15 @@ impl Debug for Input {
 }
 
 fuzz_target!(|input: Input| {
-    let mut graph = NaiveBackedDag::default();
+    let mut graph = WrappedDag::default();
 
     for method in input.methods {
         match method {
             DagMethod::Insert { node } => graph.insert(node),
-            DagMethod::Delete { node } => graph.delete(node),
+            DagMethod::Delete { node } => graph.remove(node),
             DagMethod::Connect { v, u } => graph.connect(v, u),
             DagMethod::Disconnect { v, u } => graph.disconnect(v, u),
+            DagMethod::IsReachable { v, u } => graph.is_reachable(v, u),
         }
     }
 });

@@ -5,6 +5,9 @@ use std::collections::{hash_map, VecDeque};
 use std::hash::Hash;
 use std::ops::RangeBounds;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod naive;
+
 /// An incremental directed acyclic graph, however the word 'acyclic' is used, this structure allows
 /// the existence of cycles in the hope that they will eventually be resolved and provides APIs to
 /// report the cycles to the user of the structure.
@@ -27,9 +30,11 @@ struct Entry {
     order: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Error {
+    /// The node which the operation was being performed on does not exits in the graph.
     NotFound,
+    /// There was an attempt to create/destroy a connection with same node.
     SelfLoop,
 }
 
@@ -58,8 +63,8 @@ enum ControlFlow {
     Stop,
     /// Continue as normal.
     Continue,
-    /// Skip visiting the children.
-    SkipChildren,
+    // /// Skip visiting the children.
+    // SkipChildren,
 }
 
 /// A visitor that stops when it finds a target node.
@@ -101,7 +106,7 @@ where
     }
 
     /// Insert a new node to the graph.
-    pub fn insert(&mut self, node: N) {
+    pub fn insert(&mut self, node: N) -> bool {
         if let hash_map::Entry::Vacant(e) = self.nodes.entry(node) {
             let entry = Entry {
                 order: self.next_order,
@@ -110,6 +115,9 @@ where
             let index = self.entries.insert(entry);
             e.insert(index);
             self.next_order += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -158,22 +166,25 @@ where
             return Err(Error::SelfLoop);
         }
 
-        // insert the edge.
-        let (v_order, u_order) = {
-            let tmp = self.entries.get2_mut(v_index, u_index);
-            let v_entry = tmp.0.unwrap();
-            let u_entry = tmp.1.unwrap();
-            if !v_entry.forward.insert(u_index) {
-                // the connection already exists.
-                return Ok(false);
-            }
-            u_entry.backward.insert(v_index);
-            (v_entry.order, u_entry.order)
-        };
-
-        if v_order > u_order {
-            self.add_edge_helper(v_index, u_index, false);
+        if self
+            .entries
+            .get(v_index)
+            .unwrap()
+            .forward
+            .contains(&u_index)
+        {
+            // The connection already exits.
+            return Ok(false);
         }
+
+        self.add_edge_helper(v_index, u_index, false);
+
+        // Perform the insertion.
+        let tmp = self.entries.get2_mut(v_index, u_index);
+        let v_entry = tmp.0.unwrap();
+        let u_entry = tmp.1.unwrap();
+        v_entry.forward.insert(u_index);
+        u_entry.backward.insert(v_index);
 
         Ok(true)
     }
@@ -248,6 +259,9 @@ where
             (Some(v_index), Some(u_index)) => (v_index, u_index),
             _ => return false,
         };
+        if v_index == u_index {
+            return false;
+        }
         let v_entry = self.entries.get(*v_index).unwrap();
         let u_entry = self.entries.get(*u_index).unwrap();
         // construct the traverser that searches for `u`.
@@ -256,13 +270,13 @@ where
         traverser.push_index(*v_index);
         // return the result based on the searches.
         if v_entry.order < u_entry.order {
-            traverser.traverse(&self, 0..=u_entry.order, &mut visitor);
+            traverser.traverse(self, 0..=u_entry.order, &mut visitor);
             visitor.found
-        } else if !self.cycles.is_empty() {
+        } else if self.cycles.is_empty() {
             // If there is no cycle in this graph, then there is not gonna be a path from v->u.
             false
         } else {
-            traverser.traverse(&self, 0..=u64::MAX, &mut visitor);
+            traverser.traverse(self, 0..=u64::MAX, &mut visitor);
             visitor.found
         }
     }
@@ -283,7 +297,7 @@ where
             }
 
             let v = cycle.0;
-            let u = cycle.0;
+            let u = cycle.1;
 
             // check for the existence of v -> u.
             // the add_edge_helper function checks the existence of u -> v, and if it exits then
@@ -291,10 +305,11 @@ where
             let mut visitor = SearchVisitor::new(u);
             let mut traverser = DagTraverser::new(Direction::Forward);
             traverser.push_index(v);
-            traverser.traverse(&self, 0..=u64::MAX, &mut visitor);
+            traverser.traverse(self, 0..=u64::MAX, &mut visitor);
 
             if !visitor.found {
-                // The cycle is resolved so we can move on.
+                // The cycle is resolved so we can move on. But the edge is not removed so this
+                // means we have to do something to reorder the graph.
                 continue;
             }
 
@@ -305,15 +320,20 @@ where
     /// Performs the necessary reordering upon insertion of a new edge, it is also called from
     /// update_cycles for when a cycle is resolved.
     fn add_edge_helper(&mut self, v_index: Index, u_index: Index, visit_all: bool) {
-        let mut traverser = DagTraverser::new(Direction::Forward);
-        let mut visited_forward = CollectVisitor::default();
-        let mut visited_backward = CollectVisitor::default();
-
         let (v_order, u_order) = {
             let v_entry = self.entries.get(v_index).unwrap();
             let u_entry = self.entries.get(u_index).unwrap();
             (v_entry.order, u_entry.order)
         };
+
+        // If we're already sorted, don't do anything.
+        if v_order <= u_order {
+            // return;
+        }
+
+        let mut traverser = DagTraverser::new(Direction::Forward);
+        let mut visited_forward = CollectVisitor::default();
+        let mut visited_backward = CollectVisitor::default();
 
         let range = if self.cycles.is_empty() && !visit_all {
             0..=v_order
@@ -331,7 +351,7 @@ where
             self.cycles.insert(Cycle(v_index, u_index));
         } else {
             // Reorder the graph to maintain the topological ordering.
-            traverser.move_backward();
+            traverser.direction = Direction::Backward;
             traverser.push_index(v_index);
             traverser.traverse(self, (u_order + 1).., &mut visited_backward);
             let visited_forward = visited_forward.collected;
@@ -407,32 +427,20 @@ impl DagTraverser {
         self.stack.push_front(index);
     }
 
-    /// Change the traverse's direction to move forward.
-    #[inline(always)]
-    pub fn move_forward(&mut self) {
-        self.direction = Direction::Forward;
-    }
-
-    /// Change the traverse's direction to move backward.
-    #[inline(always)]
-    pub fn move_backward(&mut self) {
-        self.direction = Direction::Backward;
-    }
-
     /// Start visiting the provided graph at the given range with the provided visitor.
     pub fn traverse<N, R: RangeBounds<u64>, V: Visitor>(
         &mut self,
         dag: &Dag<N>,
-        range: R,
+        _range: R,
         visitor: &mut V,
     ) {
         while let Some(index) = self.stack.pop_back() {
             let entry = dag.entries.get(index).unwrap();
 
             // check if the node is within the range of our traversal.
-            if !range.contains(&entry.order) {
-                continue;
-            }
+            // if !range.contains(&entry.order) {
+            //     continue;
+            // }
 
             // only visit once.
             if !self.visited.insert(index) {
@@ -443,7 +451,7 @@ impl DagTraverser {
             match visitor.visit(&index, entry.order) {
                 ControlFlow::Continue => {}
                 ControlFlow::Stop => break,
-                ControlFlow::SkipChildren => continue,
+                // ControlFlow::SkipChildren => continue,
             }
 
             // get the next nodes we have to visit depending on the direction.
