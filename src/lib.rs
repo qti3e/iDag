@@ -105,7 +105,7 @@ where
         }
     }
 
-    /// Insert a new node to the graph.
+    /// Insert a new node to the graph. Returns `false` if the node already existed in the graph.
     pub fn insert(&mut self, node: N) -> bool {
         if let hash_map::Entry::Vacant(e) = self.nodes.entry(node) {
             let entry = Entry {
@@ -121,7 +121,8 @@ where
         }
     }
 
-    /// Remove a node from the graph.
+    /// Remove a node from the graph. Returns the node which got removed in an `Option`, if the node
+    /// did not exist in the first place `None` is returned.
     pub fn remove<Q: ?Sized>(&mut self, node: &Q) -> Option<N>
     where
         N: Borrow<Q>,
@@ -152,7 +153,22 @@ where
         Some(node)
     }
 
-    //// Insert a new edge to the graph.
+    //// Insert a new edge to the graph. Returns an error if either one of the nodes is not present
+    /// in the graph, `Ok(false)` is returned if the connection already existed in the graph.
+    ///
+    /// If the same node is passed for both the values of `v` and `u` then `Err(Error::SelfLoop)`
+    /// is returned.
+    ///
+    /// ```
+    /// use interactive_dag::{Dag, Error};
+    /// let mut g = Dag::<u32>::new();
+    /// assert_eq!(g.connect(&0, &0), Err(Error::NotFound));
+    /// g.insert(0);
+    /// assert_eq!(g.connect(&0, &0), Err(Error::SelfLoop));
+    /// g.insert(1);
+    /// assert_eq!(g.connect(&0, &1), Ok(true));
+    /// assert_eq!(g.connect(&0, &1), Ok(false));
+    /// ```
     pub fn connect<Q: ?Sized>(&mut self, v: &Q, u: &Q) -> Result<bool, Error>
     where
         N: Borrow<Q>,

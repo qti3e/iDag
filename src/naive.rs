@@ -3,6 +3,9 @@ use fnv::{FnvHashMap, FnvHashSet};
 use generational_arena::Index;
 use std::collections::{hash_map, VecDeque};
 
+/// The implementation wrapped with a naive reference implementation, after every operation a series
+/// of test is performed to check the correctness of the main implementation. This is used for our
+/// fuzzing purposes.
 #[derive(Default)]
 pub struct WrappedDag {
     edges: FnvHashMap<Node, FnvHashSet<Node>>,
@@ -152,19 +155,25 @@ impl WrappedDag {
         false
     }
 
+    /// Naive implementation for update_cycles which goes through every cycle and checks if it is
+    /// still present or not.
     fn update_cycles(&mut self) {
         let cycles = std::mem::take(&mut self.cycles);
+
         for (v, u) in cycles {
+            // A cycle is only present if for an edge `(v, u)` both v->u and u->v resolve.
             if self.trusted_is_reachable(v, u) && self.trusted_is_reachable(u, v) {
                 self.cycles.insert((v, u));
             }
         }
 
+        // If there is not a cycle, check the correctness of the topological ordering.
         if self.cycles.is_empty() {
             self.assert_topological_order();
         }
     }
 
+    /// For every edge `(v, u)` in the graph check if `v` is coming before `u` in the ordering.
     fn assert_topological_order(&self) {
         assert!(self.cycles.is_empty() && self.dag.cycles.is_empty());
         for (v, set) in &self.edges {
@@ -179,6 +188,74 @@ impl WrappedDag {
                     u,
                     u_order
                 );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+pub mod fuzz {
+    use super::*;
+    use arbitrary::Arbitrary;
+    use std::fmt::{Debug, Formatter};
+
+    #[derive(Arbitrary)]
+    pub struct Input {
+        pub methods: Vec<DagMethod>,
+    }
+
+    #[derive(Arbitrary)]
+    pub enum DagMethod {
+        Insert { node: Node },
+        Delete { node: Node },
+        Connect { v: Node, u: Node },
+        Disconnect { v: Node, u: Node },
+        IsReachable { v: Node, u: Node },
+    }
+
+    impl Debug for DagMethod {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            match self {
+                DagMethod::Insert { node } => {
+                    write!(f, "g.insert({:?});", node)
+                }
+                DagMethod::Delete { node } => {
+                    write!(f, "g.remove({:?});", node)
+                }
+                DagMethod::Connect { v, u } => {
+                    write!(f, "g.connect({:?}, {:?});", v, u)
+                }
+                DagMethod::Disconnect { v, u } => {
+                    write!(f, "g.disconnect({:?}, {:?});", v, u)
+                }
+                DagMethod::IsReachable { v, u } => {
+                    write!(f, "g.is_reachable({:?}, {:?});", v, u)
+                }
+            }
+        }
+    }
+
+    impl Debug for Input {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            let mut result = String::new();
+            for method in &self.methods {
+                result.push_str(&format!("{:?}", method));
+                result.push('\n');
+            }
+
+            f.write_str(result.as_str())
+        }
+    }
+
+    impl WrappedDag {
+        #[inline(always)]
+        pub fn run(&mut self, method: DagMethod) {
+            match method {
+                DagMethod::Insert { node } => self.insert(node),
+                DagMethod::Delete { node } => self.remove(node),
+                DagMethod::Connect { v, u } => self.connect(v, u),
+                DagMethod::Disconnect { v, u } => self.disconnect(v, u),
+                DagMethod::IsReachable { v, u } => self.is_reachable(v, u),
             }
         }
     }

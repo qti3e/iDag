@@ -53,6 +53,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "interactive-dag"
+version = "0.0.1"
+dependencies = [
+ "arbitrary",
+ "fnv",
+ "generational-arena",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -85,21 +94,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86f0b0d4bf799edbc74508c1e8bf170ff5f41238e5f8225603ca7caaae2b7860"
 
 [[package]]
-name = "poisoned-dag"
-version = "0.1.0"
-dependencies = [
- "arbitrary",
- "fnv",
- "generational-arena",
-]
-
-[[package]]
 name = "poisoned-dag-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "interactive-dag",
  "libfuzzer-sys",
- "poisoned-dag",
 ]
 
 [[package]]

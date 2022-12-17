@@ -1,4 +1,4 @@
-# Poisoned DAG
+#  Interactive DAG
 
 An (not-yet) efficient incremental DAG for real-time type verification systems or other purposes.
 
